@@ -1,212 +1,228 @@
-# -*- coding: utf-8 -*-
-# Katarsees Assistant — aiogram 2.x
+import os
+import requests
+from fastapi import FastAPI, Request, HTTPException, Header
 
-# ==== НАЛАШТУВАННЯ (твій продакшн) ====
-TOKEN       = "8490324981:AAE4f89VWfWmhYzLa_jBw0FVubGFObbvIzw"     # твій токен
-ADMIN_ID    = 6958130111                                           # твій Telegram user_id
-PAYMENT_LINK = "https://send.monobank.ua/jar/8tw85dr9Rb"           # посилання на оплату
+# ===== ENV =====
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+BASE_URL = os.environ["BASE_URL"].rstrip("/")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+ADMIN_ID = os.getenv("ADMIN_ID")  # рядком, напр. "6958130111"
 
-# ==== ІМПОРТИ ====
-import html
-import csv
-from datetime import datetime
+API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-from aiogram import Bot, Dispatcher, types
-from aiogram.types import ParseMode, ReplyKeyboardMarkup, KeyboardButton
-from aiogram.utils import executor
+app = FastAPI(title="Katarsees Assistant")
 
-# ==== ФАЙЛИ ЗАЯВОК ====
-DIAG_CSV   = "leads.csv"          # діагностика
-CONSULT_CSV= "consult_leads.csv"  # консультація
-COURSE_CSV = "course_leads.csv"   # навчання
-
-# ==== СТАНИ (простий трекер, без FSM) ====
-awaiting_diag     = set()
-awaiting_consult  = set()
-awaiting_course   = set()
-
-# ==== КЛАВІАТУРИ ====
-def main_keyboard():
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.row(KeyboardButton("🔮 Діагностика"), KeyboardButton("💰 Оплата"))
-    kb.row(KeyboardButton("📚 Навчання"))
-    kb.row(KeyboardButton("🗓️ Запис на консультацію"))
-    return kb
-
-def learning_keyboard():
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add(KeyboardButton("📝 Запис на курс"))
-    kb.add(KeyboardButton("⬅️ Назад"))
-    return kb
-
-# ==== ХЕЛПЕРИ ====
-def admin_user_line(user: types.User) -> str:
-    uname = f"@{user.username}" if user.username else "—"
-    full  = user.full_name or "—"
-    return f"{full}, {uname}"
-
-def ensure_csv_header(filename: str, header: list):
+# ===== helpers =====
+def tg_call(method: str, payload: dict, timeout=15):
     try:
-        with open(filename, "r", encoding="utf-8-sig"):
-            pass
-    except FileNotFoundError:
-        with open(filename, "w", newline="", encoding="utf-8-sig") as f:
-            csv.writer(f).writerow(header)
+        return requests.post(f"{API}/{method}", json=payload, timeout=timeout)
+    except Exception:
+        return None
 
-def save_lead(filename: str, user: types.User, text: str, source: str):
-    ensure_csv_header(
-        filename,
-        ["timestamp", "tg_id", "username", "full_name", "request", "source", "contact"]
-    )
-    with open(filename, "a", newline="", encoding="utf-8-sig") as f:
-        w = csv.writer(f)
-        w.writerow([
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            user.id,
-            user.username or "",
-            user.full_name or "",
-            text,
-            source,
-            ""  # поле під контакт, лишаємо порожнім (можеш заповнювати пізніше)
-        ])
+def send_msg(chat_id: int, text: str, kb: dict | None = None):
+    data = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    if kb:
+        data["reply_markup"] = kb
+    tg_call("sendMessage", data)
 
-async def notify_admin(kind: str, user: types.User, text: str, extra: str = ""):
-    # Формуємо акуратне HTML-повідомлення адмінам
-    html_msg = (
-        f"🔔 <b>Нова заявка ({html.escape(kind)})!</b>\n"
-        f"👤 Ім’я: {html.escape(user.full_name or '—')}\n"
-        f"🆔 ID: <code>{user.id}</code>\n"
-        f"🗣️ Користувач: {html.escape(admin_user_line(user))}\n"
-        f"✍️ Текст: <i>{html.escape(text)}</i>\n"
-    )
-    if extra:
-        html_msg += f"{extra}\n"
-    await bot.send_message(ADMIN_ID, html_msg, parse_mode=ParseMode.HTML)
+def edit_msg(chat_id: int, message_id: int, text: str, ikb: dict | None = None):
+    data = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    if ikb:
+        data["reply_markup"] = ikb
+    tg_call("editMessageText", data)
 
-# ==== БОТ/ДИСПЕТЧЕР ====
-bot = Bot(token=TOKEN, parse_mode=ParseMode.HTML)
-dp  = Dispatcher(bot)
+def answer_cbq(cb_id: str, text: str = "", alert: bool = False):
+    tg_call("answerCallbackQuery", {"callback_query_id": cb_id, "text": text, "show_alert": alert})
 
-# ==== /start ====
-@dp.message_handler(commands=["start"])
-async def cmd_start(message: types.Message):
-    await message.answer(
-        "🌕 Вітаю! Я — помічниця Katarsees. Оберіть, що вас цікавить:",
-        reply_markup=main_keyboard()
-    )
+def set_webhook(url: str) -> bool:
+    payload = {"url": url}
+    if WEBHOOK_SECRET:
+        payload["secret_token"] = WEBHOOK_SECRET
+    r = tg_call("setWebhook", payload)
+    try:
+        return bool(r and r.json().get("ok"))
+    except Exception:
+        return False
 
-# ==== ОПЛАТА ====
-@dp.message_handler(lambda m: m.text == "💰 Оплата")
-async def pay(message: types.Message):
-    await message.answer(
-        f"💳 Оплата: {PAYMENT_LINK}\n\nПісля оплати надішліть квитанцію 🌙",
-    )
+def kb_main():
+    return {
+        "keyboard": [
+            [{"text": "📝 Подати заявку"}],
+            [{"text": "🔮 Діагностика (опис)"}],
+            [{"text": "🕯 Підтримка"}],
+            [{"text": "⬅️ Меню"}],
+        ],
+        "resize_keyboard": True,
+    }
 
-# ==== ДІАГНОСТИКА ====
-@dp.message_handler(lambda m: m.text == "🔮 Діагностика")
-async def diag(message: types.Message):
-    awaiting_consult.discard(message.from_user.id)
-    awaiting_course.discard(message.from_user.id)
-    awaiting_diag.add(message.from_user.id)
-    await message.answer(
-        "✨ Напишіть коротко, що вас турбує. Я передам повідомлення Katarsees 🕯️"
-    )
+def ikb_lead_controls(user_chat_id: int):
+    # у callback_data кодуємо дію та chat_id користувача
+    return {
+        "inline_keyboard": [[
+            {"text": "✅ Прийняти", "callback_data": f"lead|accept|{user_chat_id}"},
+            {"text": "❓ Уточнити", "callback_data": f"lead|clarify|{user_chat_id}"},
+            {"text": "⛔ Відхилити", "callback_data": f"lead|reject|{user_chat_id}"},
+        ]]
+    }
 
-# ==== ЗАПИС НА КОНСУЛЬТАЦІЮ ====
-@dp.message_handler(lambda m: m.text == "🗓️ Запис на консультацію")
-async def consult(message: types.Message):
-    awaiting_diag.discard(message.from_user.id)
-    awaiting_course.discard(message.from_user.id)
-    awaiting_consult.add(message.from_user.id)
-    await message.answer(
-        "📅 Щоб записатися на консультацію, напишіть зручний день і час.\n"
-        "Katarsees підтвердить запис у повідомленні 🌙"
-    )
+# ===== FastAPI lifecycle =====
+@app.on_event("startup")
+def on_startup():
+    wh = f"{BASE_URL}/webhook/{BOT_TOKEN}"
+    ok = set_webhook(wh)
+    print("Webhook set:" if ok else "Failed to set webhook", wh)
 
-# ==== НАВЧАННЯ ====
-@dp.message_handler(lambda m: m.text == "📚 Навчання")
-async def learning(message: types.Message):
-    txt = (
-        "✨ <b>Навчання Яснобачення і Ментальна магія</b>\n\n"
-        "1️⃣ Повний курс (3 міс., індивідуально): <b>25 000₴</b>/міс\n"
-        "2️⃣ Група (самостійне): <b>5 000₴</b>/міс\n"
-        "3️⃣ Один урок: <b>1 000₴</b>\n\n"
-        "Instagram-бонус: напишіть слово <b>INSTAZNIJKA</b> — і отримаєте знижку 🌙\n\n"
-        "Щоб залишити заявку, натисніть «📝 Запис на курс»."
-    )
-    await message.answer(txt, reply_markup=learning_keyboard())
-
-@dp.message_handler(lambda m: m.text == "📝 Запис на курс")
-async def learning_register(message: types.Message):
-    awaiting_diag.discard(message.from_user.id)
-    awaiting_consult.discard(message.from_user.id)
-    awaiting_course.add(message.from_user.id)
-    await message.answer(
-        "🧘 Вкажіть формат (повний курс / група / один урок), своє ім’я та @username або телефон.\n"
-        "Katarsees зв’яжеться з вами найближчим часом 🌕"
-    )
-
-@dp.message_handler(lambda m: m.text == "⬅️ Назад")
-async def go_back(message: types.Message):
-    awaiting_diag.discard(message.from_user.id)
-    awaiting_consult.discard(message.from_user.id)
-    awaiting_course.discard(message.from_user.id)
-    await message.answer("⬅️ Повертаємось до головного меню:", reply_markup=main_keyboard())
-
-# ==== КЕЧ-ОЛЛ: приймає текст після вибору дії ====
-@dp.message_handler(content_types=types.ContentTypes.TEXT)
-async def catch_all_text(message: types.Message):
-    uid = message.from_user.id
-    txt = message.text.strip()
-
-    # 1) Діагностика
-    if uid in awaiting_diag:
-        save_lead(DIAG_CSV, message.from_user, txt, "diagnostics")
-        await notify_admin("діагностика", message.from_user, txt)
-        awaiting_diag.discard(uid)
-        await message.answer("✅ Дякую! Повідомлення передано Katarsees. Очікуйте відповідь 🌙", reply_markup=main_keyboard())
+def verify_secret(header_token):
+    if not WEBHOOK_SECRET:
         return
+    if header_token != WEBHOOK_SECRET:
+        raise HTTPException(status_code=401, detail="Invalid secret token")
 
-    # 2) Консультація
-    if uid in awaiting_consult:
-        save_lead(CONSULT_CSV, message.from_user, txt, "consult")
-        await notify_admin("запис на консультацію", message.from_user, txt)
-        awaiting_consult.discard(uid)
-        await message.answer("✅ Заявку на консультацію збережено. Очікуйте підтвердження 🌙", reply_markup=main_keyboard())
-        return
+# ===== handlers =====
+@app.post("/webhook/{token}")
+async def webhook(token: str, request: Request,
+                  x_telegram_bot_api_secret_token: str | None = Header(None)):
+    if token != BOT_TOKEN:
+        raise HTTPException(status_code=403, detail="Bad token")
+    verify_secret(x_telegram_bot_api_secret_token)
 
-    # 3) Навчання
-    if uid in awaiting_course:
-        save_lead(COURSE_CSV, message.from_user, txt, "learning")
-        # Перевірка інстаграм-знижки
-        extra = ""
-        if "instaznijka".lower() in txt.lower():
-            extra = "🌟 Знижка: INSTAZNIJKA"
-        await notify_admin("навчання", message.from_user, txt, extra)
-        awaiting_course.discard(uid)
-        await message.answer("✅ Дякую! Заявку на навчання збережено. Katarsees зв’яжеться з вами 🌙", reply_markup=main_keyboard())
-        return
+    upd = await request.json()
 
-    # Якщо людина пише щось без вибору розділу
-    if txt.lower() in {"/start", "start", "/start@Katarsees_bot"}:
-        await cmd_start(message)
-        return
+    # --- callback from admin buttons ---
+    if "callback_query" in upd:
+        cb = upd["callback_query"]
+        cb_id = cb["id"]
+        from_id = cb["from"]["id"]
+        data = cb.get("data", "")
 
-    await message.answer("Оберіть дію на клавіатурі нижче ⬇️", reply_markup=main_keyboard())
+        if not ADMIN_ID or str(from_id) != str(ADMIN_ID):
+            answer_cbq(cb_id, "Лише для адміністратора.", alert=True)
+            return {"ok": True}
 
-# ==== ТЕСТ ДЛЯ АДМІНА (перевірка ПМ) ====
-@dp.message_handler(commands=["test_alert"])
-async def test_alert(message: types.Message):
-    await notify_admin("Тестове сповіщення", message.from_user, "Це тестове повідомлення.")
-    await message.answer("Відправлено тестове сповіщення адмінам.")
+        if data.startswith("lead|"):
+            try:
+                _, action, user_chat_str = data.split("|")
+                user_chat_id = int(user_chat_str)
+            except Exception:
+                answer_cbq(cb_id, "Некоректні дані.", alert=True)
+                return {"ok": True}
 
-# ==== ЗАПУСК ====
-import asyncio
+            msg = cb.get("message", {})
+            admin_chat = msg["chat"]["id"]
+            admin_msg_id = msg["message_id"]
+            original_text = msg.get("text", "")
 
-if __name__ == "__main__":
-    print("✅ Бот запускається…")
-    # створюємо і реєструємо подієвий цикл вручну (потрібно для Python 3.11)
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    from aiogram.utils import executor
-    executor.start_polling(dp, skip_updates=True)
+            status_map = {
+                "accept": "✅ <b>Статус:</b> Прийнято",
+                "clarify": "❓ <b>Статус:</b> Уточнити",
+                "reject": "⛔ <b>Статус:</b> Відхилено",
+            }
+            status_line = status_map.get(action, "")
+
+            # 1) оновлюємо адмін-повідомлення (залишимо кнопки або приберемо — на твій смак)
+            edit_msg(admin_chat, admin_msg_id, f"{original_text}\n\n{status_line}")
+
+            # 2) повідомляємо користувача
+            if action == "accept":
+                send_msg(user_chat_id,
+                    "Твоя заявка прийнята ✅\n"
+                    "Незабаром отримаєш подальші інструкції 🕯")
+            elif action == "clarify":
+                send_msg(user_chat_id,
+                    "Потрібно трохи більше деталей ❓\n"
+                    "Будь ласка, відповідай одним повідомленням:\n"
+                    "• Суть запиту (1–2 речення)\n"
+                    "• Скільки часу це триває?\n"
+                    "• Що вже пробувала робити?\n")
+            elif action == "reject":
+                send_msg(user_chat_id,
+                    "Зараз не можу взяти цей запит ⛔\n"
+                    "Можеш спробувати сформулювати інакше або звернутись пізніше.")
+
+            answer_cbq(cb_id, "Готово")
+        return {"ok": True}
+
+    # --- messages ---
+    if "message" in upd:
+        msg = upd["message"]
+        chat_id = msg["chat"]["id"]
+        text = (msg.get("text") or "").strip()
+        user = msg.get("from", {})
+        username = user.get("username") or "—"
+        name = (" ".join([user.get("first_name",""), user.get("last_name","")])).strip() or "—"
+
+        low = text.lower()
+
+        if text.startswith("/start") or low == "⬅️ меню":
+            send_msg(chat_id,
+                "Вітаю, Душе 🌕\n\n"
+                "Я — Асистент <b>Katarsees</b>. Я проведу тебе крізь потік, у якому пробуджується Сила.\n\n"
+                "Обери, що тобі потрібно зараз:",
+                kb_main()
+            )
+            return {"ok": True}
+
+        if "подати заявку" in low:
+            send_msg(chat_id,
+                "Запит прийнято 🌿\n\n"
+                "Напиши одним повідомленням:\n"
+                "• Ім’я\n"
+                "• @нік або посилання на профіль/канал\n"
+                "• Що саме потрібно (діагностика / навчання / інше)\n"
+                "• Кілька слів — <i>чому відгукнулося саме зараз</i> 💫\n\n"
+                "Пиши чесно. Тут тебе чують.",
+                kb_main()
+            )
+            return {"ok": True}
+
+        if "діагностика (опис)" in low:
+            send_msg(chat_id,
+                "Діагностика — це дзеркало Душі 🕯️\n\n"
+                "Через енергію видно, де ти втратила себе, що виснажує, і де схована твоя справжня сила.\n"
+                "Хочеш, я поясню коротко, як проходить процес? — напиши «так».",
+                kb_main()
+            )
+            return {"ok": True}
+
+        if "підтримка" in low:
+            send_msg(chat_id,
+                "Ти не одна 💜\n\n"
+                "Напиши, що тебе турбує — і я передам це в потік Katarsees.\n"
+                "Навіть якщо просто хочеш виговоритись — це вже початок очищення.",
+                kb_main()
+            )
+            return {"ok": True}
+
+        # Всі інші повідомлення — вважаємо заявкою/зверненням
+        if ADMIN_ID:
+            admin_text = (
+                "📩 <b>Нове звернення</b>\n"
+                f"• user: @{username} ({name})\n"
+                f"• chat_id: <code>{chat_id}</code>\n"
+                f"• text:\n{text}"
+            )
+            tg_call("sendMessage", {
+                "chat_id": int(ADMIN_ID),
+                "text": admin_text,
+                "parse_mode": "HTML",
+                "reply_markup": ikb_lead_controls(chat_id)
+            })
+
+        send_msg(chat_id, "Дякую! Заявку/повідомлення надіслано. Очікуй відповіді 🕯", kb_main())
+
+    return {"ok": True}
+
+@app.get("/")
+def root():
+    return {"status": "ok"}
