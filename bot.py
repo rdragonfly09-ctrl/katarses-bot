@@ -1,345 +1,201 @@
 # bot.py
-# Katarsees Assistant — Render-friendly (без aiogram/aiohttp)
-# Працює через FastAPI + вебхук Telegram Bot API.
-# Використовує інлайн-кнопки для адміна: Прийняти / Відхилити / Уточнити.
-# Автор: для Red Dragonfly 💫
-
 import os
-import time
-import uuid
-import typing as T
-import requests
-from fastapi import FastAPI, Request, Header, HTTPException
-from pydantic import BaseModel
+from typing import Optional
 
-# ──────────────────────────
-# ENV
-# ──────────────────────────
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "secret_777")
+from fastapi import FastAPI, Request, Response
+from fastapi.responses import JSONResponse
+from aiogram import Bot, Dispatcher, F
+from aiogram.types import (
+    Update, Message, ReplyKeyboardMarkup, KeyboardButton,
+    InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+)
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.context import FSMContext
 
-if not BOT_TOKEN or not ADMIN_ID or not BASE_URL:
-    raise RuntimeError("BOT_TOKEN / ADMIN_ID / BASE_URL must be set in Environment.")
+# ========= ENV =========
+BOT_TOKEN: str = os.getenv("BOT_TOKEN", "").strip()
+ADMIN_ID_RAW: str = os.getenv("ADMIN_ID", "").strip()
+WEBHOOK_SECRET: str = os.getenv("WEBHOOK_SECRET", "").strip()
 
-API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+if not BOT_TOKEN:
+    raise RuntimeError("Set BOT_TOKEN in Environment")
+if not ADMIN_ID_RAW.isdigit():
+    raise RuntimeError("Set ADMIN_ID (numeric Telegram ID) in Environment")
+if not WEBHOOK_SECRET:
+    raise RuntimeError("Set WEBHOOK_SECRET in Environment")
 
-# ──────────────────────────
-# FastAPI
-# ──────────────────────────
-app = FastAPI(title="Katarsees Assistant")
+ADMIN_ID: int = int(ADMIN_ID_RAW)
 
-# ──────────────────────────
-# МІНІ-ПАМ’ЯТЬ (стейт користувача)
-# зберігаємо коротко що чекаємо від користувача після натискання кнопки
-# { user_id: {"state": "...", "ts": <time>} }
-# ──────────────────────────
-STATE: dict[int, dict] = {}
+# ========= AIOGRAM CORE =========
+bot = Bot(BOT_TOKEN, parse_mode="HTML")
+dp = Dispatcher(storage=MemoryStorage())
+app = FastAPI()
 
-def set_state(user_id: int, state: str | None):
-    if state is None:
-        STATE.pop(user_id, None)
-    else:
-        STATE[user_id] = {"state": state, "ts": time.time()}
+# ========= KEYBOARDS =========
+main_kb = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="🔮 Діагностика"), KeyboardButton(text="📚 Навчання")],
+        [KeyboardButton(text="💰 Оплата")],
+        [KeyboardButton(text="🗓️ Запис на консультацію")],
+    ],
+    resize_keyboard=True
+)
 
-def get_state(user_id: int) -> str | None:
-    rec = STATE.get(user_id)
-    # чистимо старі стейти > 2 год
-    if rec and (time.time() - rec.get("ts", 0) > 2*60*60):
-        STATE.pop(user_id, None)
-        return None
-    return rec["state"] if rec else None
+back_kb = ReplyKeyboardMarkup(
+    keyboard=[[KeyboardButton(text="⬅️ Назад")]],
+    resize_keyboard=True
+)
 
-# ──────────────────────────
-# Допоміжні: відправка в TG
-# ──────────────────────────
-def tg(method: str, payload: dict) -> dict:
-    r = requests.post(f"{API}/{method}", json=payload, timeout=15)
-    if r.status_code != 200:
-        raise RuntimeError(f"TG error {r.status_code}: {r.text}")
-    data = r.json()
-    if not data.get("ok"):
-        raise RuntimeError(f"TG not ok: {data}")
-    return data["result"]
-
-def send_message(chat_id: int, text: str, reply_markup: dict | None = None, parse_mode: str = "HTML"):
-    return tg("sendMessage", {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": parse_mode,
-        "disable_web_page_preview": True,
-        "reply_markup": reply_markup or {}
-    })
-
-def answer_callback_query(callback_query_id: str, text: str = "", show_alert: bool = False):
-    tg("answerCallbackQuery", {
-        "callback_query_id": callback_query_id,
-        "text": text,
-        "show_alert": show_alert
-    })
-
-def edit_message_reply_markup(chat_id: int, message_id: int, reply_markup: dict | None = None):
-    tg("editMessageReplyMarkup", {
-        "chat_id": chat_id,
-        "message_id": message_id,
-        "reply_markup": reply_markup or {}
-    })
-
-# ──────────────────────────
-# Клавіатури
-# ──────────────────────────
-def main_menu_kbd() -> dict:
-    # звичайна ReplyKeyboardMarkup
-    return {
-        "keyboard": [
-            [{"text": "🗓️ Запис на консультацію"}],
-            [{"text": "🔮 Діагностика"}],
-            [{"text": "📚 Навчання"}],
-            [{"text": "💰 Оплата"}],
-            [{"text": "⬅️ Назад"}],
+def admin_decision_kb(user_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Прийняти", callback_data=f"decide:ok:{user_id}"),
+            InlineKeyboardButton(text="❌ Відхилити", callback_data=f"decide:no:{user_id}"),
         ],
-        "resize_keyboard": True,
-        "one_time_keyboard": False
-    }
+        [
+            InlineKeyboardButton(text="✍️ Уточнити", callback_data=f"decide:ask:{user_id}")
+        ]
+    ])
 
-def admin_decision_kbd(uid: int) -> dict:
-    # інлайн для адміна
-    return {
-        "inline_keyboard": [[
-            {"text": "✅ Прийняти", "callback_data": f"appr:{uid}:{uuid.uuid4().hex[:6]}"},
-            {"text": "❌ Відхилити", "callback_data": f"decl:{uid}:{uuid.uuid4().hex[:6]}"},
-            {"text": "❓ Уточнити", "callback_data": f"ask:{uid}:{uuid.uuid4().hex[:6]}"},
-        ]]
-    }
+# ========= STATES =========
+class Form(StatesGroup):
+    waiting_request = State()   # клієнт пише одне повідомлення-заявку
 
-# ──────────────────────────
-# Тексти-відповіді (можеш правити сміливо)
-# ──────────────────────────
-WELCOME = (
-    "Вітаю, я <b>Katarsees Assistant</b> ✨\n"
-    "Обери розділ нижче або просто напиши свій запит.\n"
-    "Я передам його Katarsees і ми повернемося з відповіддю 🕯"
-)
-
-TXT_ZAPYS = (
-    "🗓️ <b>Запис на консультацію</b>\n\n"
-    "Вкажи формат (онлайн/очно), зручний часовий пояс, своє ім’я + @username або телефон. "
-    "Katarsees зв’яжеться з тобою найближчим часом 🌗"
-)
-
-TXT_DIAG = (
-    "🔮 <b>Діагностика</b>\n\n"
-    "Напиши коротко, що болить: енергія, любов, шлях, фінанси, родові теми. "
-    "Katarsees бачить глибше, ніж здається 👁‍🕯"
-)
-
-TXT_NAVCH = (
-    "📚 <b>Навчання</b>\n\n"
-    "Хочеш повний курс чи пробний урок? Напиши рівень підготовки та ціль. "
-    "Katarsees підкаже, з чого краще стартувати 🔥"
-)
-
-TXT_OPLATA = (
-    "💰 <b>Оплата</b>\n\n"
-    "Оплата — це енергетичний договір. Реквізити надішлемо після підтвердження твого запиту 🪶"
-)
-
-TXT_BACK = "Повертаємось у головне меню ⤴️"
-
-TXT_SENT = "Дякую! Заявку/повідомлення надіслано. Очікуй відповіді від Katarsees 🕯"
-
-# ──────────────────────────
-# Встановлення вебхука при старті
-# ──────────────────────────
-def set_webhook():
-    url = f"{BASE_URL}/webhook"
-    # Секретний токен — обов’язково!
-    tg("setWebhook", {
-        "url": url,
-        "allowed_updates": ["message", "callback_query"],
-        "secret_token": WEBHOOK_SECRET,
-        # на Render без self-signed сертифікатів — тому нічого додатково не шлемо
-        "drop_pending_updates": True
-    })
-
-@app.on_event("startup")
-def on_startup():
-    set_webhook()
-
-# ──────────────────────────
-# Моделі апдейту (мінімальні)
-# ──────────────────────────
-class From(BaseModel):
-    id: int
-    first_name: str | None = None
-    username: str | None = None
-
-class Chat(BaseModel):
-    id: int
-    type: str
-
-class Message(BaseModel):
-    message_id: int
-    chat: Chat
-    text: str | None = None
-    from_: From | None = None
-
-    class Config:
-        fields = {"from_": "from"}
-
-class CallbackQuery(BaseModel):
-    id: str
-    from_: From
-    message: Message
-    data: str
-
-    class Config:
-        fields = {"from_": "from"}
-
-class Update(BaseModel):
-    update_id: int
-    message: Message | None = None
-    callback_query: CallbackQuery | None = None
-
-# ──────────────────────────
-# Логіка
-# ──────────────────────────
-def is_admin(user_id: int) -> bool:
-    return user_id == ADMIN_ID
-
-def forward_application_to_admin(
-    user_id: int, first_name: str, username: str | None, text: str, kind: str
-):
-    uname = f"@{username}" if username else "—"
-    msg = (
-        f"🔔 <b>Нова заявка ({kind})</b>!\n"
-        f"🧿 Ім’я: {first_name or '—'}\n"
-        f"🪪 ID: <code>{user_id}</code>\n"
-        f"📢 Користувач: {first_name or '—'}, {uname}\n"
-        f"✍️ Текст: {text}"
+# ========= BASIC HANDLERS =========
+@dp.message(F.text == "/start")
+async def cmd_start(msg: Message):
+    await msg.answer(
+        "Вітаю! Я асистент. Обери розділ нижче — або напиши повідомлення.",
+        reply_markup=main_kb
     )
-    send_message(ADMIN_ID, msg, reply_markup=admin_decision_kbd(user_id))
 
-def handle_text(user: From, chat_id: int, text: str):
-    t = (text or "").strip()
+@dp.message(F.text == "⬅️ Назад")
+async def go_back(msg: Message, state: FSMContext):
+    await state.clear()
+    await msg.answer("Повертаємось до головного меню:", reply_markup=main_kb)
 
-    # меню
-    if t in ("/start", "⬅️ Назад"):
-        send_message(chat_id, WELCOME, reply_markup=main_menu_kbd())
-        set_state(user.id, None)
-        return
+@dp.message(F.text == "🔮 Діагностика")
+async def diagnostics_info(msg: Message):
+    text = (
+        "✨ Напишіть коротко, що вас турбує — і я передам повідомлення Katarsees.\n"
+        "Можна додати @username або телефон для звʼязку."
+    )
+    await msg.answer(text, reply_markup=back_kb)
 
-    # кнопки верхнього рівня
-    if t == "🗓️ Запис на консультацію":
-        send_message(chat_id, TXT_ZAPYS, reply_markup=main_menu_kbd())
-        set_state(user.id, "ZAPYS")
-        return
-    if t == "🔮 Діагностика":
-        send_message(chat_id, TXT_DIAG, reply_markup=main_menu_kbd())
-        set_state(user.id, "DIAG")
-        return
-    if t == "📚 Навчання":
-        send_message(chat_id, TXT_NAVCH, reply_markup=main_menu_kbd())
-        set_state(user.id, "NAVCH")
-        return
-    if t == "💰 Оплата":
-        send_message(chat_id, TXT_OPLATA, reply_markup=main_menu_kbd())
-        set_state(user.id, None)
-        return
+@dp.message(F.text == "📚 Навчання")
+async def education_info(msg: Message):
+    text = (
+        "📚 Навчання: повний курс / група / індивідуально / один урок.\n"
+        "Напишіть формат, своє імʼя та @username/телефон — Katarsees відповість найближчим часом."
+    )
+    await msg.answer(text, reply_markup=back_kb)
 
-    # якщо користувач у стані — трактуємо як заявку
-    state = get_state(user.id)
-    if state in ("ZAPYS", "DIAG", "NAVCH"):
-        kind = {"ZAPYS": "консультація", "DIAG": "діагностика", "NAVCH": "навчання"}[state]
-        forward_application_to_admin(user.id, user.first_name or "", user.username, t, kind)
-        send_message(chat_id, TXT_SENT, reply_markup=main_menu_kbd())
-        set_state(user.id, None)
-        return
+@dp.message(F.text == "💰 Оплата")
+async def payment_info(msg: Message):
+    text = (
+        "💳 Оплата: реквізити надсилаються індивідуально після узгодження формату.\n"
+        "Напишіть свій запит або натисніть «🗓️ Запис на консультацію»."
+    )
+    await msg.answer(text, reply_markup=back_kb)
 
-    # дефолт — просто перекидаємо як повідомлення/заявку
-    forward_application_to_admin(user.id, user.first_name or "", user.username, t, "повідомлення")
-    send_message(chat_id, TXT_SENT, reply_markup=main_menu_kbd())
+@dp.message(F.text == "🗓️ Запис на консультацію")
+async def start_request(msg: Message, state: FSMContext):
+    await state.set_state(Form.waiting_request)
+    text = (
+        "📝 Напишіть ОДНИМ повідомленням:\n"
+        "• Імʼя\n"
+        "• @username або телефон\n"
+        "• Що потрібно (діагностика/навчання/інше)\n"
+        "• Короткий опис запиту\n\n"
+        "Після надсилання — я передам заявку та повернуся з відповіддю 🕯️"
+    )
+    await msg.answer(text, reply_markup=back_kb)
 
-# ──────────────────────────
-# Обробка колбеків адміна
-# callback_data формат: "<verb>:<user_id>:<nonce>"
-# ──────────────────────────
-def handle_admin_callback(cb: CallbackQuery):
-    if not is_admin(cb.from_.id):
-        answer_callback_query(cb.id, "Лише для адміністратора.", True)
+# ловимо заявку
+@dp.message(Form.waiting_request, F.text)
+async def catch_request(msg: Message, state: FSMContext):
+    await state.clear()
+
+    user = msg.from_user
+    uid = user.id
+    uname = ("@" + user.username) if user.username else "—"
+    full_name = user.full_name
+
+    # повідомлення клієнту
+    await msg.answer("Дякую! Заявку надіслано. Очікуйте відповіді 🕯️", reply_markup=main_kb)
+
+    # повідомлення адмінові
+    admin_text = (
+        "🔔 <b>Нова заявка!</b>\n"
+        f"👤 <b>Імʼя:</b> {full_name}\n"
+        f"🆔 <b>ID:</b> <code>{uid}</code>\n"
+        f"📣 <b>Користувач:</b> {uname}\n"
+        f"🖋 <b>Текст:</b> {msg.text}"
+    )
+
+    try:
+        await bot.send_message(
+            ADMIN_ID, admin_text, reply_markup=admin_decision_kb(uid)
+        )
+    except Exception:
+        # якщо ADMIN_ID невірний або бот не може написати адмінові
+        pass
+
+# універсальна відповідь на всякий текст поза станами
+@dp.message()
+async def fallback(msg: Message):
+    await msg.answer("Я почув(ла) вас. Оберіть розділ нижче або натисніть «🗓️ Запис на консультацію».",
+                     reply_markup=main_kb)
+
+# ========= ADMIN CALLBACKS =========
+@dp.callback_query(F.data.startswith("decide:"))
+async def on_decide(cb: CallbackQuery):
+    # дозволяємо натискати тільки адмінові
+    if cb.from_user.id != ADMIN_ID:
+        await cb.answer("Лише для адміністратора.", show_alert=True)
         return
 
     try:
-        verb, uid_str, _ = cb.data.split(":", 2)
-        target = int(uid_str)
+        _, action, user_id_str = cb.data.split(":")
+        target_id = int(user_id_str)
     except Exception:
-        answer_callback_query(cb.id, "Некоректні дані.", True)
+        await cb.answer("Некоректні дані.", show_alert=True)
         return
 
-    if verb == "appr":
-        # Прийняти
-        send_message(target,
-            "✅ <b>Запит підтверджено</b>.\n"
-            "Katarsees скоро надішле подальші кроки або реквізити 🕯",
-            reply_markup=main_menu_kbd())
-        answer_callback_query(cb.id, "Підтверджено.")
-        # (опц) прибрати кнопки під адмін-повідомленням
-        edit_message_reply_markup(cb.message.chat.id, cb.message.message_id, {})
-        return
+    if action == "ok":
+        await bot.send_message(target_id,
+                               "✅ Заявку прийнято. Katarsees незабаром зʼявиться з деталями.")
+        await cb.message.answer("✅ Відповідь клієнту надіслано.")
+        await cb.answer()
+    elif action == "no":
+        await bot.send_message(target_id,
+                               "❌ На жаль, наразі не можу взяти вашу заявку. "
+                               "Можна спробувати пізніше або уточнити формат.")
+        await cb.message.answer("❌ Відповідь клієнту надіслано.")
+        await cb.answer()
+    elif action == "ask":
+        await bot.send_message(target_id,
+                               "✍️ Будь ласка, надішліть, що саме потрібно уточнити — і я передам Katarsees.")
+        await cb.message.answer("✍️ Запит на уточнення надіслано клієнту.")
+        await cb.answer()
+    else:
+        await cb.answer("Невідома дія.", show_alert=True)
 
-    if verb == "decl":
-        # Відхилити
-        send_message(target,
-            "❌ <b>Запит відхилено</b>.\n"
-            "Якщо хочеш — надішли новий запит з уточненнями 💫",
-            reply_markup=main_menu_kbd())
-        answer_callback_query(cb.id, "Відхилено.")
-        edit_message_reply_markup(cb.message.chat.id, cb.message.message_id, {})
-        return
-
-    if verb == "ask":
-        # Запросити уточнення
-        send_message(target,
-            "❓ <b>Потрібні уточнення</b>.\n"
-            "Напиши, будь ласка: тема/ціль + що саме очікуєш від результату. "
-            "Після відповіді я передам повідомлення Katarsees 🕯",
-            reply_markup=main_menu_kbd())
-        answer_callback_query(cb.id, "Надіслано прохання уточнити.")
-        edit_message_reply_markup(cb.message.chat.id, cb.message.message_id, {})
-        return
-
-    answer_callback_query(cb.id, "Невідомо.")
-
-# ──────────────────────────
-# Вебхук
-# ──────────────────────────
-@app.post("/webhook")
-async def webhook(req: Request, x_telegram_bot_api_secret_token: str = Header(None)):
-    # Перевіряємо секрет
-    if x_telegram_bot_api_secret_token != WEBHOOK_SECRET:
-        raise HTTPException(status_code=401, detail="Bad secret")
-
-    data = await req.json()
-    upd = Update(**data)
-
-    if upd.message and upd.message.text is not None:
-        m = upd.message
-        frm = m.from_
-        if frm is None:
-            return {"ok": True}
-        handle_text(frm, m.chat.id, m.text)
-        return {"ok": True}
-
-    if upd.callback_query:
-        handle_admin_callback(upd.callback_query)
-        return {"ok": True}
-
-    return {"ok": True}
-
-# ──────────────────────────
-# Healthcheck (опційно)
-# ──────────────────────────
+# ========= FASTAPI =========
 @app.get("/")
-def root():
-    return {"ok": True, "bot": "Katarsees Assistant"}
+async def root():
+    return {"status": "ok"}
+
+# ВАЖЛИВО: маршрут вебхука існує завжди → більше не буде 404
+@app.post("/webhook/{secret:path}")
+async def telegram_webhook(secret: str, request: Request):
+    # якщо секрет не збігається — повертаємо 403 (а не 404),
+    # щоб Telegram бачив існуючу кінцеву точку
+    if secret != WEBHOOK_SECRET:
+        return Response(status_code=403)
+
+    data = await request.json()
+    update = Update.model_validate(data, context={"bot": bot})
+    await dp.feed_webhook_update(bot, update)
+    return JSONResponse({"ok": True})
