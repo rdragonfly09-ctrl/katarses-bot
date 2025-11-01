@@ -1,164 +1,132 @@
 import os
 import logging
-from typing import Dict, Tuple
+from typing import Final
 
-from fastapi import FastAPI, Request
-import httpx
+from fastapi import FastAPI, Request, HTTPException
+import uvicorn
 
 from aiogram import Bot, Dispatcher, Router, types, F
-from aiogram.filters import Command
+from aiogram.filters import CommandStart, Text
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.exceptions import TelegramBadRequest
 
-# ----------------- БАЗА -----------------
+# ----------------- НАЛАШТУВАННЯ -----------------
 logging.basicConfig(level=logging.INFO)
+BOT_TOKEN: Final = os.getenv("BOT_TOKEN", "").strip()
+BASE_URL:  Final = os.getenv("BASE_URL", "").strip().rstrip("/")
+WEBHOOK_SECRET: Final = os.getenv("WEBHOOK_SECRET", "katars3es_42")
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # твій numeric ID
-BASE_URL = os.getenv("BASE_URL")            # напр. https://katarsees-bot-xxxx.onrender.com (без / в кінці)
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "katars3es_42")  # будь-який рядок, але той самий і в ENV
+if not BOT_TOKEN or not BASE_URL:
+    raise RuntimeError("Вкажи BOT_TOKEN і BASE_URL у змінних середовища")
 
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 r = Router()
 dp.include_router(r)
 
-app = FastAPI()
+app = FastAPI(title="Katarsees Assistant")
 
-# in-memory «CRM» для відповідей адміна: key=admin_msg_id, val=(user_id, user_msg_id)
-ADMIN_LINKS: Dict[int, Tuple[int, int]] = {}
+WEBHOOK_PATH = f"/webhook/{WEBHOOK_SECRET}"
+WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}"
 
-# ----------------- КНОПКИ -----------------
-def main_kb():
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add("🔮 Діагностика", "💰 Оплата")
-    kb.add("📚 Навчання")
-    kb.add("🗓️ Запис на консультацію")
-    return kb
 
-# ----------------- ХЕЛПЕРИ -----------------
-async def send_admin_application(msg: types.Message, kind: str):
-    """Надсилає заявку в адмін із інлайн-кнопками"""
-    user = msg.from_user
-    title = "🔔 Нова заявка" if kind != "діагностика" else "🔔 Нова заявка (діагностика)"
-    text = (
-        f"{title}!\n"
-        f"👤 Ім’я: {user.full_name}\n"
-        f"🆔 ID: {user.id}\n"
-        f"📣 Користувач: {user.username and '@'+user.username or '—'}\n"
-        f"🖊️ Текст: {msg.text}"
-    )
-
-    kb = types.InlineKeyboardMarkup(inline_keyboard=[
-        [types.InlineKeyboardButton(text="✅ Прийняти", callback_data="adm_accept"),
-         types.InlineKeyboardButton(text="❌ Відхилити", callback_data="adm_reject")],
-        [types.InlineKeyboardButton(text="❓ Питання", callback_data="adm_ask")]
+# ----------------- КЛАВІАТУРИ -----------------
+def main_inline_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🔮 Діагностика", callback_data="act:diag"),
+            InlineKeyboardButton(text="💵 Оплата", callback_data="act:pay"),
+        ],
+        [
+            InlineKeyboardButton(text="📚 Навчання", callback_data="act:study"),
+            InlineKeyboardButton(text="🗓️ Запис на консультацію", callback_data="act:consult"),
+        ],
+        [
+            InlineKeyboardButton(text="📝 Запис на курс", callback_data="act:course"),
+            InlineKeyboardButton(text="⬅️ Назад", callback_data="nav:back"),
+        ],
     ])
 
-    admin_sent = await bot.send_message(ADMIN_ID, text, reply_markup=kb)
-    ADMIN_LINKS[admin_sent.message_id] = (msg.chat.id, msg.message_id)
 
 # ----------------- ХЕНДЛЕРИ -----------------
-@r.message(Command("start"))
-async def start(message: types.Message):
-    await message.answer(
-        "Привіт! Я *Katarsees Assistant*. Обери, що тебе цікавить 👇",
-        reply_markup=main_kb(),
-        parse_mode="Markdown",
-    )
+WELCOME_TEXT = (
+    "Вітаю! Обери дію нижче 👇\n\n"
+    "Якщо кнопки не працюють — натисни /start ще раз."
+)
 
-@r.message(F.text == "🔮 Діагностика")
-async def m_diag(message: types.Message):
-    await message.answer(
-        "✨ Напиши коротко, що тебе турбує — я передам повідомлення Katarsees.",
-        reply_markup=main_kb()
-    )
+@r.message(CommandStart())
+async def on_start(m: types.Message):
+    await m.answer(WELCOME_TEXT, reply_markup=main_inline_kb())
 
-@r.message(F.text == "💰 Оплата")
-async def m_pay(message: types.Message):
-    await message.answer(
-        "💵 Після підтвердження заявки надішлю конкретні реквізити для оплати.",
-        reply_markup=main_kb()
-    )
+# універсальна відповідь + повернення меню
+async def _answer_and_menu(message: types.Message, text: str):
+    await message.answer(text)
+    await message.answer("Що робимо далі?", reply_markup=main_inline_kb())
 
-@r.message(F.text == "📚 Навчання")
-async def m_learn(message: types.Message):
-    await message.answer(
-        "📚 Обери формат: повний курс / група / один урок. Напиши в одному повідомленні.",
-        reply_markup=main_kb()
-    )
+# callback-и (НЕ залежать від тексту кнопок)
+@r.callback_query(Text(startswith="act:"))
+async def on_action(cb: types.CallbackQuery):
+    action = cb.data.split(":", 1)[1]
+    await cb.answer()  # прибрати "loading"
+    if action == "diag":
+        await _answer_and_menu(cb.message, "🔮 Діагностика: напишіть коротко запит або натисніть /start, щоб обрати інше.")
+    elif action == "pay":
+        await _answer_and_menu(cb.message, "💵 Оплата: реквізити та умови надішлю окремо після підтвердження заявки.")
+    elif action == "study":
+        await _answer_and_menu(cb.message, "📚 Навчання: курс триває 8 міс (група) або 3 міс (індивідуально).")
+    elif action == "consult":
+        await _answer_and_menu(cb.message, "🗓️ Запис на консультацію: напишіть зручний день/час, я підберу слот.")
+    elif action == "course":
+        await _answer_and_menu(cb.message, "📝 Запис на курс: залиште ім'я, нік у Telegram/Instagram і коротку мотивацію.")
+    else:
+        await _answer_and_menu(cb.message, "Команда не розпізнана. Спробуй ще раз.")
 
-@r.message(F.text == "🗓️ Запис на консультацію")
-async def m_consult(message: types.Message):
-    await message.answer(
-        "🗓️ Напиши *одним* повідомленням:\n"
-        "• Ім’я\n"
-        "• @нік або телефон\n"
-        "• Що потрібно (діагностика/навчання/інше)\n"
-        "• Короткий опис запиту",
-        parse_mode="Markdown",
-        reply_markup=main_kb()
-    )
+@r.callback_query(Text("nav:back"))
+async def on_back(cb: types.CallbackQuery):
+    await cb.answer()
+    try:
+        await cb.message.edit_text(WELCOME_TEXT, reply_markup=main_inline_kb())
+    except TelegramBadRequest:
+        # якщо вже редагували — просто надішлемо нове
+        await cb.message.answer(WELCOME_TEXT, reply_markup=main_inline_kb())
 
-# Будь-який інший текст — трактуємо як заявку
-@r.message()
-async def any_text(message: types.Message):
-    await message.answer("Дякую! Заявку/повідомлення надіслано. Очікуйте відповіді 🕯️")
-    await send_admin_application(message, kind="звичайна")
+# fallback на будь-який текст
+@r.message(F.text)
+async def on_text(m: types.Message):
+    logging.info(f"text from {m.from_user.id}: {m.text!r}")
+    await m.answer("Я вас почула. Скористайтесь меню нижче 👇", reply_markup=main_inline_kb())
 
-# ----------------- АДМІН КНОПКИ -----------------
-@r.callback_query(F.data == "adm_accept")
-async def cb_accept(cb: types.CallbackQuery):
-    link = ADMIN_LINKS.get(cb.message.message_id)
-    if not link:
-        await cb.answer("Нема прив’язки до заявки (ймовірно перезапуск).", show_alert=True)
-        return
-    user_id, _ = link
-    await bot.send_message(user_id, "✅ Заявку прийнято. Katarsees зв’яжеться з вами найближчим часом 🕯️")
-    await cb.answer("Відповідь надіслано.")
-    await cb.message.edit_reply_markup()
-
-@r.callback_query(F.data == "adm_reject")
-async def cb_reject(cb: types.CallbackQuery):
-    link = ADMIN_LINKS.get(cb.message.message_id)
-    if not link:
-        await cb.answer("Нема прив’язки до заявки (ймовірно перезапуск).", show_alert=True)
-        return
-    user_id, _ = link
-    await bot.send_message(user_id, "❌ Заявку відхилено. Дякуємо за звернення.")
-    await cb.answer("Відповідь надіслано.")
-    await cb.message.edit_reply_markup()
-
-@r.callback_query(F.data == "adm_ask")
-async def cb_ask(cb: types.CallbackQuery):
-    link = ADMIN_LINKS.get(cb.message.message_id)
-    if not link:
-        await cb.answer("Нема прив’язки до заявки (ймовірно перезапуск).", show_alert=True)
-        return
-    user_id, _ = link
-    await bot.send_message(
-        user_id,
-        "❓ Потрібні уточнення: будь ласка, надішліть додаткові деталі у відповідь на це повідомлення."
-    )
-    await cb.answer("Запит надіслано.")
-    await cb.message.edit_reply_markup()
 
 # ----------------- ВЕБХУК -----------------
-@app.post(f"/webhook/{WEBHOOK_SECRET}")
-async def webhook(request: Request):
-    data = await request.json()
-    logging.info("Incoming update: %s", data)
-    update = types.Update(**data)
+@app.on_event("startup")
+async def on_startup():
+    # гарантовано прибираємо старі вебхуки/пулинги і ставимо один актуальний
+    await bot.delete_webhook(drop_pending_updates=True)
+    await bot.set_webhook(WEBHOOK_URL)
+    info = await bot.get_webhook_info()
+    logging.info(f"Webhook set to: {info.url}")
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    await bot.session.close()
+
+@app.get("/health")
+async def health():
+    return {"ok": True, "webhook": WEBHOOK_URL}
+
+@app.post(WEBHOOK_PATH)
+async def telegram_webhook(request: Request):
+    # простий захист: тільки наш шлях з SECRET
+    try:
+        update = types.Update.model_validate(await request.json(), context={"bot": bot})
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Bad request: {e}")
     await dp.feed_update(bot, update)
     return {"ok": True}
 
-@app.on_event("startup")
-async def on_startup():
-    webhook_url = f"{BASE_URL}/webhook/{WEBHOOK_SECRET}"
-    async with httpx.AsyncClient() as client:
-        await client.get(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook")
-        resp = await client.get(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook",
-            params={"url": webhook_url}
-        )
-        logging.info("SetWebhook: %s", resp.text)
-    logging.info("Webhook set -> %s", webhook_url)
+
+# ----------------- ЛОКАЛЬНИЙ СТАРТ (за бажання) -----------------
+if __name__ == "__main__":
+    # Запуск локально: uvicorn main:app --host 0.0.0.0 --port 8000
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
